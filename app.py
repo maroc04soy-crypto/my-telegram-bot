@@ -4,9 +4,10 @@ import shlex
 import unicodedata
 import difflib
 from tabulate import tabulate
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes, CallbackQueryHandler, \
+    JobQueue
 import os
 import asyncio
 from dotenv import load_dotenv
@@ -91,7 +92,6 @@ replies_db = data['replies_db']
 texts = data['texts']
 schedule = data['schedule']
 
-HADITH_LIST = texts.get("hadiths", [])
 pdf_texts = texts.get("pdf_texts", {})
 
 
@@ -188,17 +188,15 @@ class UserManager:
             "completed_modules": [],
             "completed_courses": [],
             "certificates": [],
-            "reminders": []
+            "sent_reminders": {}  # 🔥 الجديد: تخزين التذكيرات المرسلة
         }
 
     @staticmethod
     def clean_user_data(user):
-        """تنظيف بيانات المستخدم من الحقول المؤقتة"""
+        """تنظيف بيانات المستخدم من الحقول المؤقتة - الإصلاح: عدم حذف awaiting_new_question"""
         fields_to_remove = [
-            "messages_count", "hadith_index", "quiz_session", "final_exam_session",
-            "awaiting_reminder_text", "awaiting_reminder_date", "awaiting_reminder_time",
-            "awaiting_reminder_text_edit", "awaiting_reminder_time_edit", "awaiting_reminder_edit",
-            "editing_reminder_index", "awaiting_new_question"
+            "messages_count", "quiz_session", "final_exam_session"
+            # 🔥 تم إزالة "awaiting_new_question" من هنا
         ]
 
         for field in fields_to_remove:
@@ -206,6 +204,7 @@ class UserManager:
                 del user[field]
 
         return user
+
 
 # ============ أدوات الكورسات ============
 class CourseManager:
@@ -246,6 +245,7 @@ class CourseManager:
         except KeyError:
             return None
 
+
 # ============ الذكاء الاصطناعي ============
 class AIService:
     def __init__(self):
@@ -283,6 +283,138 @@ class AIService:
         except (genai.types.GenerateContentError, ConnectionError, TimeoutError) as e:
             print(f"Gemini AI error: {e}")
             return "⚠️ وقع خطأ أثناء محاولة جلب الإجابة."
+
+
+# ============ نظام التذكيرات التلقائية ============
+class ReminderSystem:
+    @staticmethod
+    def parse_time(time_str):
+        """تحويل وقت النص إلى كائن datetime"""
+        try:
+            start_time_str = time_str.split('-')[0].strip()
+            return datetime.strptime(start_time_str, "%H:%M")
+        except:
+            return None
+
+    @staticmethod
+    def get_today_schedule_for_user(user):
+        """الحصول على جدول اليوم للمستخدم"""
+        schedule_data = CourseManager.get_schedule_for_user(user)
+        if not schedule_data:
+            return None
+
+        today_en = WEEK_KEYS[datetime.now().weekday()]
+        return schedule_data.get(today_en, [])
+
+    @staticmethod
+    def should_send_reminder(lecture_time, user, lecture_key):
+        """التحقق إذا كان يجب إرسال التذكير"""
+        if not lecture_time:
+            return False
+
+        # 🔥 التحقق من عدم إرسال التذكير مسبقاً
+        sent_reminders = user.get("sent_reminders", {})
+        if sent_reminders.get(lecture_key):
+            return False
+
+        now = datetime.now()
+        lecture_datetime = datetime.combine(now.date(), lecture_time.time())
+        time_diff = lecture_datetime - now
+
+        # 🔥 إرسال التذكير قبل 30 دقيقة بالضبط
+        return timedelta(minutes=29) < time_diff <= timedelta(minutes=30)
+
+    @staticmethod
+    async def send_lecture_reminders(context: ContextTypes.DEFAULT_TYPE):
+        """إرسال تذكيرات المحاضرات لجميع المستخدمين"""
+        now = datetime.now()
+        today_en = WEEK_KEYS[now.weekday()]
+
+        for user in users:
+            try:
+                # 🔥 التحقق من اكتمال بيانات المستخدم
+                if not all(k in user for k in ("year", "semester", "major")):
+                    continue
+
+                # 🔥 الحصول على جدول اليوم
+                schedule_data = CourseManager.get_schedule_for_user(user)
+                if not schedule_data or today_en not in schedule_data:
+                    continue
+
+                today_lectures = schedule_data[today_en]
+                if not today_lectures:
+                    continue
+
+                for lecture in today_lectures:
+                    if isinstance(lecture, str):
+                        continue
+
+                    time_range = lecture.get("time", "")
+                    if not time_range or '-' not in time_range:
+                        continue
+
+                    # 🔥 تحليل وقت المحاضرة
+                    start_time = ReminderSystem.parse_time(time_range.split('-')[0])
+                    if not start_time:
+                        continue
+
+                    # 🔥 إنشاء مفتاح فريد للمحاضرة
+                    lecture_key = f"{today_en}_{time_range}_{lecture.get('subject', '')}"
+
+                    # 🔥 التحقق من إرسال التذكير
+                    if ReminderSystem.should_send_reminder(start_time, user, lecture_key):
+                        # 🔥 إنشاء رسالة التذكير
+                        reminder_msg = ReminderSystem.create_reminder_message(lecture, time_range)
+
+                        # 🔥 إرسال التذكير
+                        await context.bot.send_message(
+                            chat_id=user["user_id"],
+                            text=reminder_msg
+                        )
+
+                        # 🔥 تحديث حالة التذكير المرسل
+                        if "sent_reminders" not in user:
+                            user["sent_reminders"] = {}
+                        user["sent_reminders"][lecture_key] = now.isoformat()
+
+            except Exception as e:
+                print(f"خطأ في إرسال تذكير للمستخدم {user.get('user_id')}: {e}")
+
+        # 🔥 حفظ بيانات المستخدمين بعد التحديث
+        UserManager.save_users()
+
+    @staticmethod
+    def create_reminder_message(lecture, time_range):
+        """إنشاء رسالة التذكير"""
+        subject = lecture.get("subject", "غير محدد")
+        teacher = lecture.get("teacher", "غير محدد")
+        room = lecture.get("room", "غير محدد")
+
+        message = "⏰ **تذكير محاضرة قريباً!**\n\n"
+        message += f"📚 **المادة:** {subject}\n"
+        message += f"👨‍🏫 **الأستاذ:** {teacher}\n"
+        message += f"🏫 **القاعة:** {room}\n"
+        message += f"⏰ **الوقت:** {time_range}\n"
+        message += f"🕐 **تبدأ بعد:** 30 دقيقة\n\n"
+        message += "🎯 استعد للمحاضرة وحضر أدواتك!"
+
+        return message
+
+    @staticmethod
+    def cleanup_old_reminders():
+        """تنظيف التذكيرات القديمة"""
+        now = datetime.now()
+        today = now.date()
+
+        for user in users:
+            if "sent_reminders" not in user:
+                continue
+
+            # 🔥 إزالة التذكيرات الأقدم من اليوم
+            user["sent_reminders"] = {
+                key: timestamp for key, timestamp in user["sent_reminders"].items()
+                if datetime.fromisoformat(timestamp).date() == today
+            }
 
 
 # ============ الأدوات التقنية ============
@@ -397,8 +529,7 @@ class Keyboards:
             [KeyboardButton("📅 جدول المحاضرات"), KeyboardButton("📑 الامتحانات")],
             [KeyboardButton("📚 دورتي"), KeyboardButton("📚 المتون")],
             [KeyboardButton("🏢 مرافق الكلية"), KeyboardButton("❓ الأسئلة الشائعة")],
-            [KeyboardButton("📖 حديث اليوم"), KeyboardButton("🛠️ تقنيتي")],
-            [KeyboardButton("⏰ ذكرني")]
+            [KeyboardButton("🛠️ تقنيتي")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -407,15 +538,6 @@ class Keyboards:
         keyboard = [
             [KeyboardButton("🔳 مولّد QR Code")],
             [KeyboardButton("🔗 فحص الروابط")],
-            [KeyboardButton("🏠 الرجوع للرئيسية")]
-        ]
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-
-    @staticmethod
-    def reminders_menu():
-        keyboard = [
-            [KeyboardButton("➕ إضافة تذكير جديد")],
-            [KeyboardButton("✏️ تعديل/حذف التذكيرات")],
             [KeyboardButton("🏠 الرجوع للرئيسية")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
@@ -490,35 +612,9 @@ async def send_faq_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ اختر السؤال لمعرفة الجواب:", reply_markup=reply_markup)
 
 
-async def send_hadith(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
-    """إرسال حديث اليوم"""
-    if not HADITH_LIST:
-        await update.message.reply_text("لا توجد أحاديث مخزنة حالياً.", reply_markup=Keyboards.back_only())
-        return
-
-    now = datetime.now()
-    time_key = now.strftime("%Y%m%d")
-    hadith_index = hash(time_key) % len(HADITH_LIST)
-
-    hadith_entry = HADITH_LIST[hadith_index]
-    hadith_text = hadith_entry.get("text", "")
-    hadith_source = hadith_entry.get("source", "")
-
-    message = f"📖 حديث اليوم ({now.strftime('%Y-%m-%d')}):\n\n{hadith_text}\n\n📚 {hadith_source}"
-    await update.message.reply_text(message, reply_markup=Keyboards.back_only())
-
-
 async def exam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أمر الامتحانات"""
     await update.message.reply_text("اختر:", reply_markup=Keyboards.exam_menu())
-
-
-async def send_reminders_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
-    """قائمة التذكيرات"""
-    await update.message.reply_text(
-        "⏰ نظام التذكيرات:\n\nاختر ما تريد القيام به:",
-        reply_markup=Keyboards.reminders_menu()
-    )
 
 
 # ============ دوال الجدول ============
@@ -784,185 +880,21 @@ class HelperUtils:
             "answer": answer
         })
 
-        FileManager.safe_save_json(Config.TEXTS_FILE, texts_data)
+        # 🔥 الإضافة الجديدة: حفظ البيانات وتحديثها في الذاكرة مباشرة
+        if FileManager.safe_save_json(Config.TEXTS_FILE, texts_data):
+            # 🔥 تحديث البيانات في الذاكرة مباشرة
+            global texts
+            texts = FileManager.safe_load_json(Config.TEXTS_FILE, {})
 
-        questions = FileManager.safe_load_json(Config.QUESTIONS_FILE, [])
-        if data['index'] < len(questions):
-            questions.pop(data['index'])
-            FileManager.safe_save_json(Config.QUESTIONS_FILE, questions)
+            questions = FileManager.safe_load_json(Config.QUESTIONS_FILE, [])
+            if data['index'] < len(questions):
+                questions.pop(data['index'])
+                FileManager.safe_save_json(Config.QUESTIONS_FILE, questions)
 
-        del context.user_data['pending_faq']
-        await update.message.reply_text("✅ تم إضافة السؤال إلى الأسئلة الشائعة")
-
-    @staticmethod
-    async def handle_reminders_flow(update, context, user):
-        """معالجة تدفق التذكيرات"""
-        msg = update.message.text
-
-        if user.get("awaiting_reminder_text"):
-            return await HelperUtils.handle_reminder_text(update, user, msg)
-
-        elif user.get("awaiting_reminder_date"):
-            return await HelperUtils.handle_reminder_date(update, user, msg)
-
-        elif user.get("awaiting_reminder_time"):
-            return await HelperUtils.handle_reminder_time(update, user, msg)
-
-        elif user.get("awaiting_reminder_text_edit"):
-            return await HelperUtils.handle_reminder_text_edit(update, user, msg)
-
-        elif user.get("awaiting_reminder_time_edit"):
-            return await HelperUtils.handle_reminder_time_edit(update, user, msg)
-
-        return False
-
-    @staticmethod
-    async def handle_reminder_text(update, user, msg):
-        """معالجة نص التذكير"""
-        user["reminder_text"] = msg
-        user["awaiting_reminder_text"] = False
-        user["awaiting_reminder_date"] = True
-        UserManager.save_users()
-
-        await update.message.reply_text(
-            "📅 متى تريد أن أذكرك؟\n\nارسل التاريخ بالتنسيق:\nسنة-شهر-يوم (مثال: 2024-12-25)",
-            reply_markup=Keyboards.back_only()
-        )
-        return True
-
-    @staticmethod
-    async def handle_reminder_date(update, user, msg):
-        """معالجة تاريخ التذكير"""
-        date_valid = False
-        standard_date = ""
-
-        if re.match(r'^\d{4}-\d{1,2}-\d{1,2}$', msg):
-            try:
-                year, month, day = map(int, msg.split('-'))
-                datetime(year, month, day)
-                date_valid = True
-                standard_date = msg
-            except ValueError:
-                pass
-
-        elif re.match(r'^\d{1,2}-\d{1,2}-\d{4}$', msg):
-            try:
-                day, month, year = map(int, msg.split('-'))
-                datetime(year, month, day)
-                date_valid = True
-                standard_date = f"{year}-{month:02d}-{day:02d}"
-            except ValueError:
-                pass
-
-        if date_valid:
-            user["reminder_date"] = standard_date
-            user["awaiting_reminder_date"] = False
-            user["awaiting_reminder_time"] = True
-            UserManager.save_users()
-
-            await update.message.reply_text(
-                "⏰ الآن ارسل الوقت بالتنسيق:\nساعة:دقيقة (مثال: 14:30)",
-                reply_markup=Keyboards.back_only()
-            )
+            del context.user_data['pending_faq']
+            await update.message.reply_text("✅ تم إضافة السؤال إلى الأسئلة الشائعة وتحديثها مباشرة!")
         else:
-            await update.message.reply_text(
-                "⚠️ التنسيق غير صحيح.\n\nاستخدم إحدى هذه الصيغ:\n• سنة-شهر-يوم (مثال: 2024-12-25)\n• يوم-شهر-سنة (مثال: 25-12-2024)",
-                reply_markup=Keyboards.back_only()
-            )
-        return True
-
-    @staticmethod
-    async def handle_reminder_time(update, user, msg):
-        """معالجة وقت التذكير"""
-        if re.match(r'^\d{1,2}:\d{2}$', msg):
-            time_parts = msg.split(':')
-            hour, minute = int(time_parts[0]), int(time_parts[1])
-
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                reminder = {
-                    "text": user.get("reminder_text", ""),
-                    "date": user.get("reminder_date", ""),
-                    "time": msg,
-                    "datetime": f"{user.get('reminder_date')} {msg}:00",
-                    "id": datetime.now().timestamp()
-                }
-
-                if "reminders" not in user:
-                    user["reminders"] = []
-                user["reminders"].append(reminder)
-
-                fields_to_clean = ["reminder_text", "reminder_date", "awaiting_reminder_time"]
-                for field in fields_to_clean:
-                    if field in user:
-                        del user[field]
-
-                UserManager.save_users()
-
-                await update.message.reply_text(
-                    f"✅ تم إضافة التذكير:\n{reminder['text']}\n📅 التاريخ: {reminder['date']}\n⏰ الساعة: {reminder['time']}",
-                    reply_markup=Keyboards.reminders_menu()
-                )
-            else:
-                await update.message.reply_text("⚠️ الوقت غير صحيح. تأكد من إدخال وقت صحيح.")
-        else:
-            await update.message.reply_text("⚠️ التنسيق غير صحيح. استخدم ساعة:دقيقة (مثال: 14:30)")
-        return True
-
-    @staticmethod
-    async def handle_reminder_text_edit(update, user, msg):
-        """معالجة تعديل نص التذكير"""
-        rem_index = user.get("editing_reminder_index")
-        reminders = user.get("reminders", [])
-
-        if 0 <= rem_index < len(reminders):
-            reminders[rem_index]["text"] = msg
-
-            if "awaiting_reminder_text_edit" in user:
-                del user["awaiting_reminder_text_edit"]
-            if "editing_reminder_index" in user:
-                del user["editing_reminder_index"]
-            UserManager.save_users()
-
-            await update.message.reply_text(
-                f"✅ تم تعديل نص التذكير إلى:\n{msg}",
-                reply_markup=Keyboards.reminders_menu()
-            )
-        else:
-            await update.message.reply_text("⚠️ التذكير غير موجود.")
-        return True
-
-    @staticmethod
-    async def handle_reminder_time_edit(update, user, msg):
-        """معالجة تعديل وقت التذكير"""
-        rem_index = user.get("editing_reminder_index")
-        reminders = user.get("reminders", [])
-
-        if re.match(r'^\d{1,2}:\d{2}$', msg):
-            time_parts = msg.split(':')
-            hour, minute = int(time_parts[0]), int(time_parts[1])
-
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                if 0 <= rem_index < len(reminders):
-                    reminders[rem_index]["time"] = msg
-                    reminders[rem_index]["datetime"] = f"{reminders[rem_index]['date']} {msg}:00"
-
-                    if "awaiting_reminder_time_edit" in user:
-                        del user["awaiting_reminder_time_edit"]
-                    if "editing_reminder_index" in user:
-                        del user["editing_reminder_index"]
-                    UserManager.save_users()
-
-                    await update.message.reply_text(
-                        f"✅ تم تعديل الوقت إلى: {msg}",
-                        reply_markup=Keyboards.reminders_menu()
-                    )
-                else:
-                    await update.message.reply_text("⚠️ التذكير غير موجود.")
-            else:
-                await update.message.reply_text("⚠️ الوقت غير صحيح. تأكد من إدخال وقت صحيح.")
-        else:
-            await update.message.reply_text("⚠️ التنسيق غير صحيح. استخدم ساعة:دقيقة (مثال: 14:30)")
-        return True
+            await update.message.reply_text("⚠️ حدث خطأ في حفظ السؤال.")
 
 
 # ============ معالجة التسجيل ============
@@ -1025,14 +957,12 @@ class MainMenuHandler:
             "📑 الامتحانات": exam_command,
             "/exam": exam_command,
             "🏢 مرافق الكلية": send_college_map,
-            "📖 حديث اليوم": lambda u, c: send_hadith(u, c, user),
             "❓ الأسئلة الشائعة": send_faq_buttons,
             "📚 المتون": MainMenuHandler.handle_pdf_texts,
             "📚 دورتي": MainMenuHandler.handle_my_course,
             "📅 جدول المحاضرات": lambda u, c: send_schedule_menu(u, c, user),
             "/schedule": lambda u, c: send_schedule_menu(u, c, user),
-            "🛠️ تقنيتي": MainMenuHandler.handle_technology,
-            "⏰ ذكرني": lambda u, c: send_reminders_menu(u, c, user)
+            "🛠️ تقنيتي": MainMenuHandler.handle_technology
         }
 
         if msg in handlers:
@@ -1170,20 +1100,6 @@ async def handle_submenu_buttons(update, context, user, msg):
         context.user_data['awaiting_link_check'] = True
         return True
 
-    # أزرار التذكيرات الفرعية
-    elif msg == "➕ إضافة تذكير جديد":
-        user["awaiting_reminder_text"] = True
-        UserManager.save_users()
-        await update.message.reply_text(
-            "📝 بماذا تريد أن أذكرك؟\n\nاكتب المهمة أو التذكير:",
-            reply_markup=Keyboards.back_only()
-        )
-        return True
-
-    elif msg == "✏️ تعديل/حذف التذكيرات":
-        await ReminderManager.show_user_reminders(update, context, user)
-        return True
-
     # أزرار الامتحانات الفرعية
     elif msg == "📄 امتحانات سابقة":
         await update.message.reply_text(
@@ -1247,8 +1163,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = UserManager.find_user(user_id)
 
-    if user:
-        user = UserManager.clean_user_data(user)
+    # 🔥 الإصلاح: عدم تنظيف البيانات قبل التحقق من حالة السؤال الجديد
+    # if user:
+    #     user = UserManager.clean_user_data(user)
 
     if not user:
         user = UserManager.create_new_user(user_id, username)
@@ -1262,8 +1179,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await HelperUtils.handle_admin_faq_reply(update, context)
         return
 
-    if await HelperUtils.handle_reminders_flow(update, context, user):
+    # 🔥 الإصلاح: معالجة السؤال الجديد في البداية قبل أي شيء آخر
+    if user.get("awaiting_new_question"):
+        question_text = msg.strip()
+
+        # 🔥 منع الأسئلة الفارغة
+        if not question_text:
+            await update.message.reply_text("⚠️ الرجاء كتابة سؤال صحيح.", reply_markup=Keyboards.back_only())
+            return
+
+        # 🔥 حفظ السؤال في ملف الأسئلة الجديدة
+        success = HelperUtils.save_new_question_entry(user_id, username, question_text)
+
+        # تنظيف الحالة
+        user["awaiting_new_question"] = False
+        UserManager.save_users()
+
+        if success:
+            await update.message.reply_text(
+                "✅ شكراً، تم تسجيل سؤالك بنجاح! سيظهر للمشرف للمراجعة.",
+                reply_markup=Keyboards.main_menu()
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ حدث خطأ في حفظ السؤال. حاول مرة أخرى.",
+                reply_markup=Keyboards.main_menu()
+            )
         return
+
+    # 🔥 تنظيف البيانات بعد معالجة السؤال الجديد
+    if user:
+        user = UserManager.clean_user_data(user)
 
     if not user.get("year"):
         if await RegistrationHandler.handle_year_selection(update, user, msg):
@@ -1277,23 +1223,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await RegistrationHandler.handle_major_selection(update, user, msg):
             return
 
-    if user.get("awaiting_new_question"):
-        user_id = update.message.from_user.id
-        username = update.message.from_user.username or update.message.from_user.full_name
-        question_text = msg.strip()
-
-        HelperUtils.save_new_question_entry(user_id, username, question_text)
-
-        user["awaiting_new_question"] = False
-        UserManager.save_users()
-
-        await update.message.reply_text(
-            "✅ شكراً، تم تسجيل سؤالك بنجاح! سيظهر للمشرف للمراجعة.",
-            reply_markup=Keyboards.main_menu()
-        )
-        return
-
-    # 🔥 الإصلاح: معالجة الأزرار الفرعية أولاً
+    # 🔥 معالجة الأزرار الفرعية أولاً
     if await handle_submenu_buttons(update, context, user, msg):
         return
 
@@ -1337,87 +1267,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gemini_answer = ai_service.ask_gemini(update.message.text)
     await loading_msg.delete()
     await update.message.reply_text(f"🕌 جوابي حسب علمي:\n{gemini_answer}")
-
-# ============ إدارة التذكيرات ============
-class ReminderManager:
-    @staticmethod
-    async def send_reminders_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
-        """قائمة التذكيرات"""
-        await update.message.reply_text(
-            "⏰ نظام التذكيرات:\n\nاختر ما تريد القيام به:",
-            reply_markup=Keyboards.reminders_menu()
-        )
-
-    @staticmethod
-    async def handle_reminder_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
-        """معالجة إجراءات التذكيرات"""
-        msg = update.message.text.strip()
-
-        if msg == "➕ إضافة تذكير جديد":
-            user["awaiting_reminder_text"] = True
-            UserManager.save_users()  # ✅ إصلاح: كانت ناقصة الأقواس
-            await update.message.reply_text(
-                "📝 بماذا تريد أن أذكرك؟\n\nاكتب المهمة أو التذكير:",  # ✅ إصلاح: المسافات
-                reply_markup=Keyboards.back_only()  # ✅ إصلاح: المسافات
-            )
-
-        elif msg == "✏️ تعديل/حذف التذكيرات":
-            await ReminderManager.show_user_reminders(update, context, user)  # ✅ إصلاح: المسافات
-
-        elif msg == "🏠 الرجوع للرئيسية":
-            await update.message.reply_text(  # ✅ إصلاح: المسافات
-                "🏠 عدت إلى القائمة الرئيسية.",  # ✅ إصلاح: المسافات
-                reply_markup=Keyboards.main_menu()  # ✅ إصلاح: المسافات
-            )
-
-    @staticmethod
-    async def show_user_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
-        """عرض تذكيرات المستخدم"""
-        reminders = user.get("reminders", [])
-
-        if not reminders:
-            await update.message.reply_text(
-                "⚠️ ليس لديك أي تذكيرات حالياً.",
-                reply_markup=Keyboards.reminders_menu()
-            )
-            return
-
-        text = "⏰ تذكيراتك:\n\n"
-        keyboard = []
-
-        for i, reminder in enumerate(reminders, 1):
-            text += f"{i}. {reminder['text']}\n📅 {reminder['date']} ⏰ {reminder['time']}\n\n"
-            keyboard.append([
-                InlineKeyboardButton(f"✏️ تعديل {i}", callback_data=f"edit_rem_{i}"),
-                InlineKeyboardButton(f"🗑️ حذف {i}", callback_data=f"del_rem_{i}")
-            ])
-
-        keyboard.append([InlineKeyboardButton("🏠 الرجوع", callback_data="rem_back")])
-
-        await update.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    @staticmethod
-    def clean_users_data():
-        """تنظيف كافة البيانات القديمة لجميع المستخدمين"""
-        cleaned_users = []
-        for user in users:
-            cleaned_user = {
-                "user_id": user.get("user_id"),
-                "username": user.get("username"),
-                "year": user.get("year"),
-                "semester": user.get("semester"),
-                "major": user.get("major"),
-                "current_module": user.get("current_module", 1),
-                "completed_modules": user.get("completed_modules", []),
-                "completed_courses": user.get("completed_courses", []),
-                "certificates": user.get("certificates", []),
-                "reminders": user.get("reminders", [])
-            }
-            cleaned_users.append(cleaned_user)
-        return cleaned_users
 
 
 # ============ أوامر المشرفين ============
@@ -1575,36 +1424,6 @@ class AdminManager:
         final_text = "📊 إحصائيات الطلبة حسب الشعبة والفصول\n\n" + table_text
 
         await update.message.reply_text(f"<pre>{final_text}</pre>", parse_mode="HTML")
-
-
-# ============ التذكيرات المجدولة ============
-async def send_scheduled_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """إرسال التذكيرات المجدولة"""
-    current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    for user in users:
-        reminders = user.get("reminders", [])
-        reminders_to_remove = []
-
-        for i, reminder in enumerate(reminders):
-            reminder_datetime = f"{reminder['date']} {reminder['time']}"
-
-            if reminder_datetime == current_datetime:
-                try:
-                    await context.bot.send_message(
-                        chat_id=user["user_id"],
-                        text=f"⏰ تذكير:\n{reminder['text']}\n📅 التاريخ: {reminder['date']}\n⏰ الوقت: {reminder['time']}"
-                    )
-                    reminders_to_remove.append(i)
-                except Exception as e:
-                    print(f"Failed to send reminder to {user['user_id']}: {e}")
-
-        for index in sorted(reminders_to_remove, reverse=True):
-            if index < len(reminders):
-                reminders.pop(index)
-
-        if reminders_to_remove:
-            UserManager.save_users()
 
 
 # ============ معالجة الـ Callbacks ============
@@ -2221,89 +2040,6 @@ async def handle_pdf_callback(update, context):
             await query.message.reply_text("⚠️ الرابط غير متوفر حالياً.")
 
 
-async def handle_reminder_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة كولباك التذكيرات"""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    user_id = query.from_user.id
-    user, idx = UserManager.get_user_and_index(user_id)
-
-    if not user:
-        await query.edit_message_text("⚠️ المستخدم غير مسجل.")
-        return
-
-    if data.startswith("edit_rem_") and not data.startswith("edit_rem_text_") and not data.startswith("edit_rem_time_"):
-        try:
-            rem_index = int(data.split("_")[2]) - 1
-            reminders = user.get("reminders", [])
-
-            if 0 <= rem_index < len(reminders):
-                user["editing_reminder_index"] = rem_index
-                user["awaiting_reminder_edit"] = True
-                UserManager.save_users()
-
-                reminder = reminders[rem_index]
-                await query.edit_message_text(
-                    f"✏️ تعديل التذكير:\n{reminder['text']}\n📅 {reminder['date']} ⏰ {reminder['time']}\n\n"
-                    "اختر ما تريد تعديله:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📝 تعديل النص", callback_data=f"edit_rem_text_{rem_index}")],
-                        [InlineKeyboardButton("⏰ تعديل الوقت", callback_data=f"edit_rem_time_{rem_index}")],
-                        [InlineKeyboardButton("⬅️ رجوع", callback_data="rem_back")]
-                    ])
-                )
-            else:
-                await query.edit_message_text("⚠️ التذكير غير موجود.")
-        except (IndexError, ValueError):
-            await query.edit_message_text("⚠️ خطأ في معالجة التذكير.")
-
-    elif data.startswith("edit_rem_text_"):
-        try:
-            rem_index = int(data.split("_")[3])
-            user["editing_reminder_index"] = rem_index
-            user["awaiting_reminder_text_edit"] = True
-            UserManager.save_users()
-
-            await query.edit_message_text(
-                "📝 اكتب النص الجديد للتذكير:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إلغاء", callback_data="rem_back")]])
-            )
-        except (IndexError, ValueError):
-            await query.edit_message_text("⚠️ خطأ في معالجة التعديل.")
-
-    elif data.startswith("edit_rem_time_"):
-        try:
-            rem_index = int(data.split("_")[3])
-            user["editing_reminder_index"] = rem_index
-            user["awaiting_reminder_time_edit"] = True
-            UserManager.save_users()
-
-            await query.edit_message_text(
-                "⏰ اكتب الوقت الجديد (ساعة:دقيقة مثال: 14:30):",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ إلغاء", callback_data="rem_back")]])
-            )
-        except (IndexError, ValueError):
-            await query.edit_message_text("⚠️ خطأ في معالجة التعديل.")
-
-    elif data.startswith("del_rem_"):
-        try:
-            rem_index = int(data.split("_")[2]) - 1
-            reminders = user.get("reminders", [])
-            if 0 <= rem_index < len(reminders):
-                removed = reminders.pop(rem_index)
-                UserManager.save_users()
-                await query.edit_message_text(f"✅ تم حذف التذكير:\n{removed['text']}")
-            else:
-                await query.edit_message_text("⚠️ التذكير غير موجود.")
-        except (IndexError, ValueError):
-            await query.edit_message_text("⚠️ خطأ في معالجة الحذف.")
-
-    elif data == "rem_back":
-        await query.message.reply_text("⏰ عدت إلى قائمة التذكيرات.", reply_markup=Keyboards.reminders_menu())
-
-
 # ============ إعداد التطبيق الرئيسي ============
 def setup_handlers(app):
     """إعداد جميع الـ handlers"""
@@ -2319,7 +2055,6 @@ def setup_handlers(app):
     app.add_handler(CallbackQueryHandler(handle_faq_callback, pattern=r"^(add_new_question|show_my_group)"))
     app.add_handler(CallbackQueryHandler(handle_question_callback, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(CallbackHandler.course_callback_handler, pattern=r"^course_"))
-    app.add_handler(CallbackQueryHandler(handle_reminder_callbacks, pattern=r"^(edit_rem_|del_rem_|rem_back)"))
     app.add_handler(CallbackQueryHandler(handle_pdf_callback, pattern=r"^pdf_"))
 
     # معالجة الرسائل
@@ -2329,10 +2064,40 @@ def setup_handlers(app):
 def initialize_data():
     """تهيئة البيانات"""
     global users
-    users = ReminderManager.clean_users_data()
+    # تنظيف بيانات المستخدمين من الحقول غير الضرورية
+    cleaned_users = []
+    for user in users:
+        cleaned_user = {
+            "user_id": user.get("user_id"),
+            "username": user.get("username"),
+            "year": user.get("year"),
+            "semester": user.get("semester"),
+            "major": user.get("major"),
+            "current_module": user.get("current_module", 1),
+            "completed_modules": user.get("completed_modules", []),
+            "completed_courses": user.get("completed_courses", []),
+            "certificates": user.get("certificates", []),
+            "sent_reminders": user.get("sent_reminders", {})
+        }
+        cleaned_users.append(cleaned_user)
+
+    users = cleaned_users
     UserManager.save_users()
 
     print(f"👑 عدد المشرفين: {len(Config.ADMINS)}")
+
+
+async def scheduled_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """الدالة المجدولة لإرسال التذكيرات"""
+    try:
+        # 🔥 تنظيف التذكيرات القديمة أولاً
+        ReminderSystem.cleanup_old_reminders()
+
+        # 🔥 إرسال تذكيرات المحاضرات
+        await ReminderSystem.send_lecture_reminders(context)
+
+    except Exception as e:
+        print(f"خطأ في التذكيرات المجدولة: {e}")
 
 
 def main():
@@ -2341,19 +2106,24 @@ def main():
     # تهيئة البيانات
     initialize_data()
 
-    # إنشاء التطبيق
+    # إنشاء التطبيق مع JobQueue
     app = Application.builder().token(Config.TOKEN).build()
+
+    # 🔥 إعداد التذكيرات المجدولة
+    job_queue = app.job_queue
+    if job_queue:
+        # 🔥 تشغيل كل دقيقة للتحقق من التذكيرات
+        job_queue.run_repeating(
+            scheduled_reminders,
+            interval=60,  # كل دقيقة
+            first=10  # بعد 10 ثواني من التشغيل
+        )
+        print("✅ نظام التذكيرات التلقائية مفعل")
 
     # إعداد الـ handlers
     setup_handlers(app)
 
-    # إعداد التذكيرات المجدولة
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(send_scheduled_reminders, interval=60, first=10)
-
     print("🤖 البوت شغال...")
-
 
     # تشغيل البوت
     app.run_polling()
