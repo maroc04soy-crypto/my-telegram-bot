@@ -188,7 +188,9 @@ class UserManager:
             "completed_modules": [],
             "completed_courses": [],
             "certificates": [],
-            "sent_reminders": {}  # 🔥 الجديد: تخزين التذكيرات المرسلة
+            "sent_reminders": {},  # 🔥 الجديد: تخزين التذكيرات المرسلة
+            "last_active": datetime.now(timezone.utc).isoformat(),  # 🔥 الجديد: آخر نشاط
+            "message_count": 0  # 🔥 الجديد: عدد الرسائل
         }
 
     @staticmethod
@@ -204,6 +206,15 @@ class UserManager:
                 del user[field]
 
         return user
+
+    @staticmethod
+    def update_user_activity(user_id: int):
+        """تحديث نشاط المستخدم"""
+        user = UserManager.find_user(user_id)
+        if user:
+            user["last_active"] = datetime.now(timezone.utc).isoformat()
+            user["message_count"] = user.get("message_count", 0) + 1
+            UserManager.save_users()
 
 
 # ============ أدوات الكورسات ============
@@ -779,32 +790,39 @@ class ScheduleManager:
 
     @staticmethod
     def create_weekly_table(schedule_for_major):
-        """إنشاء جدول أسبوعي بتنسيق مضغوط"""
+        """إنشاء جدول أسبوعي بتنسيق جدول منظم ومبسط"""
         if not schedule_for_major:
             return "❌ لا يوجد جدول"
 
-        result = "📅 **جدول الأسبوع**\n\n"
+        result = "📅 **جدول الأسبوع الدراسي**\n\n"
         days_english = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 
         for day_key in days_english:
             arabic_day = WEEK_AR.get(day_key, day_key)
             day_schedule = schedule_for_major.get(day_key, [])
 
-            result += f"🎯 **{arabic_day}:**\n"
+            result += f"🔹 **{arabic_day}:**\n"
 
             if not day_schedule:
-                result += "   ⏸️ لا توجد حصص\n\n"
+                result += "   • لا توجد محاضرات\n\n"
                 continue
 
-            for slot in day_schedule:
+            # عرض المحاضرات في شكل قائمة منظمة
+            for i, slot in enumerate(day_schedule, 1):
+                if isinstance(slot, str):
+                    continue
+
                 time_range = slot.get("time", "غير محدد")
                 subject = slot.get("subject", "غير محدد")
                 teacher = slot.get("teacher", "غير محدد")
+                room = slot.get("room", "غير محدد")
 
-                result += f"   ⏰ {time_range} - {subject}\n"
-                result += f"   👨‍🏫 {teacher}\n"
+                result += f"   {i}️⃣ **⏰ {time_range}**\n"
+                result += f"      📚 {subject}\n"
+                result += f"      👨‍🏫 {teacher}\n"
+                result += f"      🏫 {room}\n\n"
 
-            result += "\n"
+        result += "💡 *لرؤية الجدول مع الأوقات الحية، استخدم 'جدول اليوم'*"
 
         return result
 
@@ -1163,6 +1181,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = UserManager.find_user(user_id)
 
+    # 🔥 تحديث نشاط المستخدم
+    UserManager.update_user_activity(user_id)
+
     # 🔥 الإصلاح: عدم تنظيف البيانات قبل التحقق من حالة السؤال الجديد
     # if user:
     #     user = UserManager.clean_user_data(user)
@@ -1269,7 +1290,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🕌 جوابي حسب علمي:\n{gemini_answer}")
 
 
-# ============ أوامر المشرفين ============
+# ============ أوامر المشرفين المحسنة ============
 class AdminManager:
     @staticmethod
     async def admin_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1424,6 +1445,555 @@ class AdminManager:
         final_text = "📊 إحصائيات الطلبة حسب الشعبة والفصول\n\n" + table_text
 
         await update.message.reply_text(f"<pre>{final_text}</pre>", parse_mode="HTML")
+
+    @staticmethod
+    async def add_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """إضافة سؤال شائع مباشرة"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "⚠️ الاستعمال الصحيح:\n"
+                "/add_faq \"السؤال\" \"الجواب\"\n\n"
+                "مثال:\n"
+                "/add_faq \"ما هي مواعيد الدوام؟\" \"الدوام من الأحد إلى الخميس من 8 صباحاً إلى 2 ظهراً\""
+            )
+            return
+
+        try:
+            # استخراج السؤال والجواب من الأقواس
+            text = " ".join(context.args)
+            if '"' in text:
+                parts = shlex.split(text)
+                if len(parts) >= 2:
+                    question = parts[0]
+                    answer = " ".join(parts[1:])
+                else:
+                    await update.message.reply_text("❌ يجب وضع السؤال والجواب بين أقواس")
+                    return
+            else:
+                # إذا لم تكن هناك أقواس، نأخذ أول كلمتين كسؤال والباقي كجواب
+                parts = text.split(" ", 1)
+                if len(parts) >= 2:
+                    question = parts[0]
+                    answer = parts[1]
+                else:
+                    await update.message.reply_text("❌ يجب تقديم سؤال وجواب")
+                    return
+
+            # تحميل البيانات الحالية
+            texts_data = FileManager.safe_load_json(Config.TEXTS_FILE, {})
+            if "faqs" not in texts_data:
+                texts_data["faqs"] = []
+
+            # إضافة السؤال الجديد
+            texts_data["faqs"].append({
+                "question": question,
+                "answer": answer
+            })
+
+            # حفظ البيانات
+            if FileManager.safe_save_json(Config.TEXTS_FILE, texts_data):
+                global texts
+                texts = FileManager.safe_load_json(Config.TEXTS_FILE, {})
+                await update.message.reply_text(
+                    f"✅ تم إضافة السؤال الشائع بنجاح!\n\n"
+                    f"❓ السؤال: {question}\n"
+                    f"💡 الجواب: {answer}"
+                )
+            else:
+                await update.message.reply_text("❌ حدث خطأ في حفظ السؤال")
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+    @staticmethod
+    async def edit_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """تعديل سؤال شائع موجود"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        if not context.args or len(context.args) < 3:
+            await update.message.reply_text(
+                "⚠️ الاستعمال الصحيح:\n"
+                "/edit_faq <رقم_السؤال> \"السؤال_الجديد\" \"الجواب_الجديد\"\n\n"
+                "مثال:\n"
+                "/edit_faq 1 \"ما هي المواعيد الجديدة؟\" \"المواعيد الجديدة من 8 إلى 3\"\n\n"
+                "لرؤية قائمة الأسئلة استخدم: /list_faqs"
+            )
+            return
+
+        try:
+            faq_id = int(context.args[0]) - 1  # تحويل إلى index (يبدأ من 0)
+
+            # استخراج السؤال والجواب الجديدين
+            text = " ".join(context.args[1:])
+            if '"' in text:
+                parts = shlex.split(text)
+                if len(parts) >= 2:
+                    new_question = parts[0]
+                    new_answer = " ".join(parts[1:])
+                else:
+                    await update.message.reply_text("❌ يجب وضع السؤال والجواب بين أقواس")
+                    return
+            else:
+                parts = text.split(" ", 1)
+                if len(parts) >= 2:
+                    new_question = parts[0]
+                    new_answer = parts[1]
+                else:
+                    await update.message.reply_text("❌ يجب تقديم سؤال وجواب جديدين")
+                    return
+
+            # تحميل البيانات الحالية
+            texts_data = FileManager.safe_load_json(Config.TEXTS_FILE, {})
+            if "faqs" not in texts_data or faq_id >= len(texts_data["faqs"]) or faq_id < 0:
+                await update.message.reply_text("❌ رقم السؤال غير صحيح")
+                return
+
+            # الحصول على السؤال القديم
+            old_question = texts_data["faqs"][faq_id]["question"]
+            old_answer = texts_data["faqs"][faq_id]["answer"]
+
+            # تحديث السؤال
+            texts_data["faqs"][faq_id] = {
+                "question": new_question,
+                "answer": new_answer
+            }
+
+            # حفظ البيانات
+            if FileManager.safe_save_json(Config.TEXTS_FILE, texts_data):
+                global texts
+                texts = FileManager.safe_load_json(Config.TEXTS_FILE, {})
+                await update.message.reply_text(
+                    f"✅ تم تعديل السؤال بنجاح!\n\n"
+                    f"📝 **السؤال القديم:**\n{old_question}\n💡 {old_answer}\n\n"
+                    f"📝 **السؤال الجديد:**\n{new_question}\n💡 {new_answer}"
+                )
+            else:
+                await update.message.reply_text("❌ حدث خطأ في حفظ التعديلات")
+
+        except ValueError:
+            await update.message.reply_text("❌ رقم السؤال يجب أن يكون رقماً صحيحاً")
+        except Exception as e:
+            await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+    @staticmethod
+    async def delete_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """حذف سؤال شائع"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        if not context.args or len(context.args) != 1:
+            await update.message.reply_text(
+                "⚠️ الاستعمال الصحيح:\n"
+                "/delete_faq <رقم_السؤال>\n\n"
+                "مثال:\n"
+                "/delete_faq 1\n\n"
+                "لرؤية قائمة الأسئلة استخدم: /list_faqs"
+            )
+            return
+
+        try:
+            faq_id = int(context.args[0]) - 1  # تحويل إلى index (يبدأ من 0)
+
+            # تحميل البيانات الحالية
+            texts_data = FileManager.safe_load_json(Config.TEXTS_FILE, {})
+            if "faqs" not in texts_data or faq_id >= len(texts_data["faqs"]) or faq_id < 0:
+                await update.message.reply_text("❌ رقم السؤال غير صحيح")
+                return
+
+            # الحصول على السؤال المراد حذفه
+            deleted_question = texts_data["faqs"][faq_id]["question"]
+            deleted_answer = texts_data["faqs"][faq_id]["answer"]
+
+            # حذف السؤال
+            texts_data["faqs"].pop(faq_id)
+
+            # حفظ البيانات
+            if FileManager.safe_save_json(Config.TEXTS_FILE, texts_data):
+                global texts
+                texts = FileManager.safe_load_json(Config.TEXTS_FILE, {})
+                await update.message.reply_text(
+                    f"✅ تم حذف السؤال بنجاح!\n\n"
+                    f"🗑️ **السؤال المحذوف:**\n{deleted_question}\n💡 {deleted_answer}"
+                )
+            else:
+                await update.message.reply_text("❌ حدث خطأ في حذف السؤال")
+
+        except ValueError:
+            await update.message.reply_text("❌ رقم السؤال يجب أن يكون رقماً صحيحاً")
+        except Exception as e:
+            await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+    @staticmethod
+    async def list_faqs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """عرض قائمة الأسئلة الشائعة"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        texts_data = FileManager.safe_load_json(Config.TEXTS_FILE, {})
+        faqs = texts_data.get("faqs", [])
+
+        if not faqs:
+            await update.message.reply_text("⚠️ لا توجد أسئلة شائعة حالياً.")
+            return
+
+        message = "📋 قائمة الأسئلة الشائعة:\n\n"
+        for i, faq in enumerate(faqs, 1):
+            question = faq['question']
+            answer_preview = faq['answer'][:50] + "..." if len(faq['answer']) > 50 else faq['answer']
+
+            message += f"{i}. {question}\n"
+            message += f"   💡 {answer_preview}\n\n"
+
+        message += "\n💡 الأوامر المتاحة:\n"
+        message += "/edit_faq <رقم> \"سؤال\" \"جواب\" - تعديل سؤال\n"
+        message += "/delete_faq <رقم> - حذف سؤال\n"
+        message += "/add_faq \"سؤال\" \"جواب\" - إضافة سؤال جديد"
+
+        await update.message.reply_text(message)
+
+
+# ============ أوامر الأمان الجديدة ============
+class SecurityManager:
+    @staticmethod
+    async def admins_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """عرض قائمة المشرفين"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        if not Config.ADMINS:
+            await update.message.reply_text("⚠️ لا يوجد مشرفين حالياً.")
+            return
+
+        message = "🛡️ **قائمة المشرفين:**\n\n"
+        for i, admin_id in enumerate(Config.ADMINS, 1):
+            try:
+                user = await context.bot.get_chat(admin_id)
+                username = f"@{user.username}" if user.username else "بدون معرف"
+                message += f"{i}. {user.first_name} {username} (`{admin_id}`)\n"
+            except Exception:
+                message += f"{i}. مستخدم غير متاح (`{admin_id}`)\n"
+
+        message += f"\n👑 **إجمالي المشرفين:** {len(Config.ADMINS)}"
+
+        await update.message.reply_text(message, parse_mode="Markdown")
+
+    @staticmethod
+    async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """إضافة مشرف جديد"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ الاستعمال الصحيح:\n"
+                "/add_admin <معرف_المستخدم>\n\n"
+                "مثال:\n"
+                "/add_admin 123456789"
+            )
+            return
+
+        try:
+            new_admin_id = int(context.args[0])
+
+            # التحقق من عدم إضافة المستخدم نفسه
+            if new_admin_id == user_id:
+                await update.message.reply_text("❌ لا يمكنك إضافة نفسك كمشرف.")
+                return
+
+            # التحقق من عدم وجود المستخدم مسبقاً في القائمة
+            if new_admin_id in Config.ADMINS:
+                await update.message.reply_text("❌ هذا المستخدم مشرف بالفعل.")
+                return
+
+            # إضافة المشرف الجديد
+            Config.ADMINS.append(new_admin_id)
+
+            # تحديث ملف البيئة
+            env_file = ".env"
+            if os.path.exists(env_file):
+                with open(env_file, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+
+                with open(env_file, "w", encoding="utf-8") as f:
+                    for line in lines:
+                        if line.startswith("ADMINS="):
+                            admins_str = ",".join(map(str, Config.ADMINS))
+                            f.write(f"ADMINS={admins_str}\n")
+                        else:
+                            f.write(line)
+
+            # الحصول على معلومات المستخدم الجديد
+            try:
+                new_admin_user = await context.bot.get_chat(new_admin_id)
+                admin_name = f"{new_admin_user.first_name} (@{new_admin_user.username})" if new_admin_user.username else new_admin_user.first_name
+            except:
+                admin_name = f"المستخدم ({new_admin_id})"
+
+            await update.message.reply_text(
+                f"✅ تم إضافة المشرف بنجاح!\n\n"
+                f"👤 **المشرف الجديد:** {admin_name}\n"
+                f"🆔 **المعرف:** `{new_admin_id}`\n\n"
+                f"👑 **إجمالي المشرفين الآن:** {len(Config.ADMINS)}"
+            )
+
+        except ValueError:
+            await update.message.reply_text("❌ المعرف يجب أن يكون رقماً صحيحاً.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+    @staticmethod
+    async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """إزالة مشرف"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ الاستعمال الصحيح:\n"
+                "/remove_admin <معرف_المستخدم>\n\n"
+                "مثال:\n"
+                "/remove_admin 123456789\n\n"
+                "لرؤية قائمة المشرفين استخدم: /admins_list"
+            )
+            return
+
+        try:
+            admin_to_remove = int(context.args[0])
+
+            # التحقق من عدم إزالة النفس
+            if admin_to_remove == user_id:
+                await update.message.reply_text("❌ لا يمكنك إزالة نفسك من قائمة المشرفين.")
+                return
+
+            # التحقق من وجود المشرف في القائمة
+            if admin_to_remove not in Config.ADMINS:
+                await update.message.reply_text("❌ هذا المستخدم ليس مشرفاً.")
+                return
+
+            # إزالة المشرف
+            Config.ADMINS.remove(admin_to_remove)
+
+            # تحديث ملف البيئة
+            env_file = ".env"
+            if os.path.exists(env_file):
+                with open(env_file, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+
+                with open(env_file, "w", encoding="utf-8") as f:
+                    for line in lines:
+                        if line.startswith("ADMINS="):
+                            admins_str = ",".join(map(str, Config.ADMINS))
+                            f.write(f"ADMINS={admins_str}\n")
+                        else:
+                            f.write(line)
+
+            await update.message.reply_text(
+                f"✅ تم إزالة المشرف بنجاح!\n\n"
+                f"🆔 **المعرف:** `{admin_to_remove}`\n\n"
+                f"👑 **إجمالي المشرفين الآن:** {len(Config.ADMINS)}"
+            )
+
+        except ValueError:
+            await update.message.reply_text("❌ المعرف يجب أن يكون رقماً صحيحاً.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+
+# ============ الأوامر الإدارية الجديدة ============
+class AdminReports:
+    @staticmethod
+    async def weekly_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """تقرير أسبوعي مفصل"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        # حساب التاريخ قبل أسبوع
+        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+
+        # تحليل البيانات
+        total_users = len(users)
+        new_users_week = 0
+        active_users_week = 0
+        total_messages = 0
+
+        # إحصائيات حسب التخصص
+        major_stats = {}
+        year_stats = {}
+
+        for user in users:
+            # المستخدمين الجدد
+            if "last_active" in user:
+                last_active = datetime.fromisoformat(user["last_active"])
+                if last_active >= week_ago:
+                    active_users_week += 1
+
+                    # عدد الرسائل
+                    total_messages += user.get("message_count", 0)
+
+            # إحصائيات التخصص
+            major = user.get("major", "غير محدد")
+            if major not in major_stats:
+                major_stats[major] = 0
+            major_stats[major] += 1
+
+            # إحصائيات السنة
+            year = user.get("year", "غير محدد")
+            if year not in year_stats:
+                year_stats[year] = 0
+            year_stats[year] += 1
+
+        # حساب النشاط
+        activity_percentage = (active_users_week / total_users * 100) if total_users > 0 else 0
+
+        # بناء التقرير
+        report = "📊 **التقرير الأسبوعي**\n\n"
+        report += f"👥 **إجمالي المستخدمين:** {total_users}\n"
+        report += f"🆕 **المستخدمين النشطين (أسبوع):** {active_users_week}\n"
+        report += f"📈 **نسبة النشاط:** {activity_percentage:.1f}%\n"
+        report += f"💬 **إجمالي الرسائل:** {total_messages}\n\n"
+
+        report += "🎓 **التوزيع حسب التخصص:**\n"
+        for major, count in major_stats.items():
+            percentage = (count / total_users * 100) if total_users > 0 else 0
+            report += f"  • {major}: {count} ({percentage:.1f}%)\n"
+
+        report += "\n📚 **التوزيع حسب السنة:**\n"
+        for year, count in year_stats.items():
+            percentage = (count / total_users * 100) if total_users > 0 else 0
+            report += f"  • السنة {year}: {count} ({percentage:.1f}%)\n"
+
+        report += f"\n⏰ **آخر تحديث:** {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        await update.message.reply_text(report, parse_mode="Markdown")
+
+    @staticmethod
+    async def user_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """نشاط المستخدمين"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        # فرز المستخدمين حسب آخر نشاط
+        active_users = []
+        for user in users:
+            if "last_active" in user:
+                last_active = datetime.fromisoformat(user["last_active"])
+                message_count = user.get("message_count", 0)
+                active_users.append({
+                    "user": user,
+                    "last_active": last_active,
+                    "message_count": message_count
+                })
+
+        # ترتيب حسب آخر نشاط (الأحدث أولاً)
+        active_users.sort(key=lambda x: x["last_active"], reverse=True)
+
+        # عرض أفضل 10 مستخدمين نشاطاً
+        report = "🏆 **أكثر المستخدمين نشاطاً**\n\n"
+
+        for i, data in enumerate(active_users[:10], 1):
+            user = data["user"]
+            last_active = data["last_active"]
+            message_count = data["message_count"]
+
+            # حساب الوقت منذ آخر نشاط
+            time_diff = datetime.now(timezone.utc) - last_active
+            hours = int(time_diff.total_seconds() // 3600)
+
+            if hours < 1:
+                last_seen = "الآن"
+            elif hours < 24:
+                last_seen = f"قبل {hours} ساعة"
+            else:
+                days = hours // 24
+                last_seen = f"قبل {days} يوم"
+
+            username = user.get("username", "بدون معرف")
+            report += f"{i}. @{username}\n"
+            report += f"   💬 {message_count} رسالة | 🕐 {last_seen}\n\n"
+
+        report += f"📊 **إجمالي المستخدمين النشطين:** {len(active_users)}"
+
+        await update.message.reply_text(report, parse_mode="Markdown")
+
+    @staticmethod
+    async def growth_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """معدل نمو المستخدمين"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        # تحليل النمو (نفترض أن تاريخ الإنشاء هو أول ظهور في النظام)
+        today = datetime.now(timezone.utc).date()
+        growth_data = {}
+
+        for user in users:
+            if "last_active" in user:
+                join_date = datetime.fromisoformat(user["last_active"]).date()
+                days_since_join = (today - join_date).days
+
+                # تجميع حسب الأسبوع
+                week_key = join_date.isocalendar()[1]  # رقم الأسبوع
+                year_key = join_date.year
+                key = f"{year_key}-W{week_key}"
+
+                if key not in growth_data:
+                    growth_data[key] = 0
+                growth_data[key] += 1
+
+        # ترتيب البيانات
+        sorted_weeks = sorted(growth_data.keys())
+
+        report = "📈 **معدل نمو المستخدمين**\n\n"
+
+        if not sorted_weeks:
+            report += "⚠️ لا توجد بيانات كافية لتحليل النمو."
+        else:
+            # عرض آخر 8 أسابيع
+            recent_weeks = sorted_weeks[-8:]
+
+            total_growth = 0
+            for week in recent_weeks:
+                count = growth_data[week]
+                total_growth += count
+                report += f"📅 **أسبوع {week}:** {count} مستخدم جديد\n"
+
+            # حساب المتوسط
+            avg_growth = total_growth / len(recent_weeks) if recent_weeks else 0
+
+            report += f"\n📊 **المتوسط الأسبوعي:** {avg_growth:.1f} مستخدم"
+            report += f"\n👥 **إجمالي المستخدمين:** {len(users)}"
+
+            # توقعات النمو
+            if avg_growth > 0:
+                weekly_growth_rate = (avg_growth / len(users)) * 100 if users else 0
+                report += f"\n📈 **معدل النمو الأسبوعي:** {weekly_growth_rate:.1f}%"
+
+        report += f"\n\n⏰ **تاريخ التقرير:** {today.strftime('%Y-%m-%d')}"
+
+        await update.message.reply_text(report, parse_mode="Markdown")
 
 
 # ============ معالجة الـ Callbacks ============
@@ -2044,11 +2614,25 @@ async def handle_pdf_callback(update, context):
 def setup_handlers(app):
     """إعداد جميع الـ handlers"""
 
-    # أوامر المشرفين
+    # أوامر المشرفين المحسنة
     app.add_handler(CommandHandler("announce", AdminManager.admin_announce))
     app.add_handler(CommandHandler("stats", AdminManager.admin_stats))
     app.add_handler(CommandHandler("poll", AdminManager.admin_poll))
     app.add_handler(CommandHandler("questions", AdminManager.admin_questions))
+    app.add_handler(CommandHandler("add_faq", AdminManager.add_faq))
+    app.add_handler(CommandHandler("edit_faq", AdminManager.edit_faq))
+    app.add_handler(CommandHandler("delete_faq", AdminManager.delete_faq))
+    app.add_handler(CommandHandler("list_faqs", AdminManager.list_faqs))
+
+    # أوامر الأمان الجديدة
+    app.add_handler(CommandHandler("admins_list", SecurityManager.admins_list))
+    app.add_handler(CommandHandler("add_admin", SecurityManager.add_admin))
+    app.add_handler(CommandHandler("remove_admin", SecurityManager.remove_admin))
+
+    # الأوامر الإدارية الجديدة
+    app.add_handler(CommandHandler("weekly_report", AdminReports.weekly_report))
+    app.add_handler(CommandHandler("activity", AdminReports.user_activity))
+    app.add_handler(CommandHandler("growth", AdminReports.growth_stats))
 
     # الـ Callbacks
     app.add_handler(CallbackQueryHandler(handle_faq_callback, pattern=r"^faq_"))
@@ -2077,7 +2661,9 @@ def initialize_data():
             "completed_modules": user.get("completed_modules", []),
             "completed_courses": user.get("completed_courses", []),
             "certificates": user.get("certificates", []),
-            "sent_reminders": user.get("sent_reminders", {})
+            "sent_reminders": user.get("sent_reminders", {}),
+            "last_active": user.get("last_active", datetime.now(timezone.utc).isoformat()),
+            "message_count": user.get("message_count", 0)
         }
         cleaned_users.append(cleaned_user)
 
