@@ -64,7 +64,7 @@ class FileManager:
 
     @staticmethod
     def append_to_json(path: str, entry):
-        """إضافة مدخل جديد إلى ملف JSON"""
+        """إضافة مدخل جديدة إلى ملف JSON"""
         data = FileManager.safe_load_json(path, [])
         data.append(entry)
         return FileManager.safe_save_json(path, data)
@@ -1663,6 +1663,103 @@ class AdminManager:
 
         await update.message.reply_text(message)
 
+    @staticmethod
+    async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """عرض جميع الأوامر الإدارية المتاحة في جدول احترافي"""
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMINS:
+            await update.message.reply_text("🚫 هذا الأمر مخصص للمشرفين فقط.")
+            return
+
+        # إنشاء جدول الأوامر بشكل احترافي
+        help_sections = [
+            {
+                "emoji": "📢",
+                "category": "الإعلانات والاتصال",
+                "commands": [
+                    ("/announce", "إرسال إعلان نصي أو بملف/صورة"),
+                    ("/poll", "إنشاء استطلاع للرأي"),
+                    ("/questions", "عرض الأسئلة الجديدة")
+                ]
+            },
+            {
+                "emoji": "📊",
+                "category": "الإحصائيات والتقارير",
+                "commands": [
+                    ("/stats", "إحصائيات المستخدمين"),
+                    ("/weekly_report", "تقرير أسبوعي مفصل"),
+                    ("/activity", "نشاط المستخدمين"),
+                    ("/growth", "معدل نمو المستخدمين")
+                ]
+            },
+            {
+                "emoji": "❓",
+                "category": "إدارة الأسئلة الشائعة",
+                "commands": [
+                    ("/add_faq", "إضافة سؤال جديد"),
+                    ("/edit_faq", "تعديل سؤال موجود"),
+                    ("/delete_faq", "حذف سؤال"),
+                    ("/list_faqs", "عرض قائمة الأسئلة")
+                ]
+            },
+            {
+                "emoji": "🛡️",
+                "category": "إدارة المشرفين",
+                "commands": [
+                    ("/admins_list", "عرض قائمة المشرفين"),
+                    ("/add_admin", "إضافة مشرف جديد"),
+                    ("/remove_admin", "إزالة مشرف")
+                ]
+            },
+            {
+                "emoji": "ℹ️",
+                "category": "المساعدة",
+                "commands": [
+                    ("/admin_help", "عرض هذه القائمة")
+                ]
+            }
+        ]
+
+        # بناء الرسالة بشكل جدول احترافي
+        help_text = "👑 **لوحة تحكم المشرفين - جميع الأوامر المتاحة**\n\n"
+        help_text += "═" * 50 + "\n\n"
+
+        for section in help_sections:
+            help_text += f"{section['emoji']} **{section['category']}**\n"
+            help_text += "─" * 30 + "\n"
+
+            for command, description in section['commands']:
+                help_text += f"• `{command}` - {description}\n"
+
+            help_text += "═" * 50 + "\n\n"
+
+        help_text += "💡 **لنسخ أي أمر:** اضغط على الأمر ليتم نسخه تلقائياً"
+
+        await update.message.reply_text(
+            help_text,
+            parse_mode="Markdown"
+        )
+
+
+# ============ معالجة نسخ الأوامر ============
+async def handle_copy_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة نسخ الأوامر"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data.startswith("copy_command_"):
+        command = data.replace("copy_command_", "")
+        full_command = f"/{command}"
+
+        # نسخ الأمر إلى الحافظة
+        await query.message.reply_text(
+            f"✅ تم نسخ الأمر: `{full_command}`\n\n"
+            f"📋 **يمكنك الآن لصقه واستخدامه مباشرة**\n\n"
+            f"💡 **نصيحة:** استخدم الأمر في الدردشة الرئيسية للبوت",
+            parse_mode="Markdown"
+        )
+
 
 # ============ أوامر الأمان الجديدة ============
 class SecurityManager:
@@ -2623,6 +2720,7 @@ def setup_handlers(app):
     app.add_handler(CommandHandler("edit_faq", AdminManager.edit_faq))
     app.add_handler(CommandHandler("delete_faq", AdminManager.delete_faq))
     app.add_handler(CommandHandler("list_faqs", AdminManager.list_faqs))
+    app.add_handler(CommandHandler("admin_help", AdminManager.admin_help))
 
     # أوامر الأمان الجديدة
     app.add_handler(CommandHandler("admins_list", SecurityManager.admins_list))
@@ -2640,6 +2738,7 @@ def setup_handlers(app):
     app.add_handler(CallbackQueryHandler(handle_question_callback, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(CallbackHandler.course_callback_handler, pattern=r"^course_"))
     app.add_handler(CallbackQueryHandler(handle_pdf_callback, pattern=r"^pdf_"))
+    app.add_handler(CallbackQueryHandler(handle_copy_command_callback, pattern=r"^copy_command_"))
 
     # معالجة الرسائل
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
